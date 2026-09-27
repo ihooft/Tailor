@@ -14,6 +14,27 @@ local scanGeneration = 0
 local ARMOR_CLASS_ID = 4
 local WEAPON_CLASS_ID = 2
 
+local WEIGHTS = {
+    {"armor", "Armor", 1},
+    {"dps", "Weapon DPS", 1},
+    {"stamina", "Stamina", 0},
+    {"strength", "Strength", 0},
+    {"intellect", "Intellect", 0},
+    {"agility", "Agility", 0},
+    {"crit", "Critical Strike", 0},
+    {"haste", "Haste", 0},
+    {"spirit", "Spirit", 0},
+    {"mp5", "MP5", 0},
+    {"spellDamage", "Spell Damage", 0},
+    {"spellHealing", "Spell Healing", 0},
+}
+
+TailorDB.weights = TailorDB.weights or {}
+for _, entry in ipairs(WEIGHTS) do
+    local value = tonumber(TailorDB.weights[entry[1]])
+    TailorDB.weights[entry[1]] = value and math.max(0, math.min(1, value)) or entry[3]
+end
+
 local ARMOR_EQUIP_LOCS = {
     INVTYPE_HEAD = true,
     INVTYPE_SHOULDER = true,
@@ -33,6 +54,9 @@ local WEAPON_EQUIP_LOCS = {
     INVTYPE_2HWEAPON = true,
     INVTYPE_WEAPONMAINHAND = true,
     INVTYPE_WEAPONOFFHAND = true,
+    INVTYPE_RANGED = true,
+    INVTYPE_RANGEDRIGHT = true,
+    INVTYPE_THROWN = true,
 }
 
 local function Print(msg)
@@ -41,14 +65,6 @@ end
 
 local function GetItemIdentity(itemLink, itemID)
     return itemLink or ("item:" .. tostring(itemID))
-end
-
-local function GetArmorValue(itemLink)
-    local stats = C_Item.GetItemStats(itemLink)
-    if stats then
-        return tonumber(stats.RESISTANCE0_NAME) or 0
-    end
-    return 0
 end
 
 local function ParseDPSNumber(s)
@@ -103,6 +119,45 @@ local function GetWeaponDPS(itemLink)
     return nil
 end
 
+local function GetWeightedValue(itemLink, classID)
+    local stats = C_Item.GetItemStats(itemLink) or {}
+    local w = TailorDB.weights
+    local function Stat(key)
+        return tonumber(stats[key]) or 0
+    end
+    local total = Stat("ITEM_MOD_STAMINA_SHORT") * w.stamina
+        + Stat("ITEM_MOD_STRENGTH_SHORT") * w.strength
+        + Stat("ITEM_MOD_INTELLECT_SHORT") * w.intellect
+        + Stat("ITEM_MOD_AGILITY_SHORT") * w.agility
+        + Stat("ITEM_MOD_CRIT_RATING_SHORT") * w.crit
+        + Stat("ITEM_MOD_HASTE_RATING_SHORT") * w.haste
+        + Stat("ITEM_MOD_SPIRIT_SHORT") * w.spirit
+        + math.max(Stat("ITEM_MOD_POWER_REGEN0_SHORT"),
+            Stat("ITEM_MOD_MANA_REGENERATION_SHORT")) * w.mp5
+
+    -- Older items may have separate spell damage/healing. Retail spell power
+    -- benefits both, so count that shared stat once at the larger weight.
+    local sharedSpellPower = Stat("ITEM_MOD_SPELL_POWER_SHORT")
+    if sharedSpellPower > 0 then
+        total = total + sharedSpellPower * math.max(w.spellDamage, w.spellHealing)
+    else
+        total = total
+            + math.max(Stat("ITEM_MOD_SPELL_DAMAGE_DONE_SHORT"),
+                Stat("ITEM_MOD_SPELL_DAMAGE_DONE")) * w.spellDamage
+            + math.max(Stat("ITEM_MOD_SPELL_HEALING_DONE_SHORT"),
+                Stat("ITEM_MOD_SPELL_HEALING_DONE")) * w.spellHealing
+    end
+
+    if classID == ARMOR_CLASS_ID then
+        total = total + (tonumber(stats.RESISTANCE0_NAME) or 0) * w.armor
+    elseif classID == WEAPON_CLASS_ID and w.dps > 0 then
+        local dps = GetWeaponDPS(itemLink)
+        if not dps then return nil end
+        total = total + dps * w.dps
+    end
+    return total
+end
+
 local function GetItemInfo(itemLink, itemID, callback)
     local name, link, quality, itemLevel, minLevel, itemType, itemSubType,
           stackCount, equipLoc, texture, sellPrice, classID, subclassID =
@@ -153,12 +208,19 @@ local function GetCandidateSlots(equipLoc)
         return {17}
     elseif equipLoc == "INVTYPE_WEAPON" then
         return {16, 17}
-    elseif equipLoc == "INVTYPE_SHIELD" then
+    elseif equipLoc == "INVTYPE_RANGED"
+        or equipLoc == "INVTYPE_RANGEDRIGHT"
+        or equipLoc == "INVTYPE_THROWN" then
+        return {16}
+    elseif equipLoc == "INVTYPE_SHIELD"
+        or equipLoc == "INVTYPE_HOLDABLE" then
         return {17}
     elseif equipLoc == "INVTYPE_CLOAK" then
         return {15}
     elseif equipLoc == "INVTYPE_HEAD" then
         return {1}
+    elseif equipLoc == "INVTYPE_NECK" then
+        return {2}
     elseif equipLoc == "INVTYPE_SHOULDER" then
         return {3}
     elseif equipLoc == "INVTYPE_CHEST" or equipLoc == "INVTYPE_ROBE" then
@@ -173,6 +235,10 @@ local function GetCandidateSlots(equipLoc)
         return {9}
     elseif equipLoc == "INVTYPE_HAND" then
         return {10}
+    elseif equipLoc == "INVTYPE_FINGER" then
+        return {11, 12}
+    elseif equipLoc == "INVTYPE_TRINKET" then
+        return {13, 14}
     end
 end
 
@@ -196,48 +262,25 @@ local function GetEquippedItem(slot)
     return {
         slot = slot,
         name = name,
+        quality = quality,
         link = actualLink or link,
         itemID = itemID,
         equipLoc = actualEquipLoc or equipLoc,
         classID = classID,
-        armor = (classID == ARMOR_CLASS_ID) and GetArmorValue(actualLink or link) or 0,
-        dps = (classID == WEAPON_CLASS_ID) and GetWeaponDPS(actualLink or link) or nil,
+        value = GetWeightedValue(link, classID),
     }
 end
 
 local function MakeUpgrade(candidate, equipped, bag, bagSlot, equipSlot)
-    local result
+    if not GetCandidateSlots(candidate.equipLoc)
+        or not C_Item.IsEquippableItem(candidate.link) then return nil end
 
-    if candidate.classID == ARMOR_CLASS_ID
-        and ARMOR_EQUIP_LOCS[candidate.equipLoc]
-        and C_Item.IsEquippableItem(candidate.link)
-    then
-        local candidateArmor = GetArmorValue(candidate.link)
-        local equippedArmor = equipped and equipped.armor or 0
-
-        if candidateArmor > equippedArmor then
-            result = {
-                kind = "Armor",
-                candidateValue = candidateArmor,
-                equippedValue = equippedArmor,
-            }
-        end
-
-    elseif candidate.classID == WEAPON_CLASS_ID
-        and WEAPON_EQUIP_LOCS[candidate.equipLoc]
-        and C_Item.IsEquippableItem(candidate.link)
-    then
-        local candidateDPS = GetWeaponDPS(candidate.link)
-        local equippedDPS = equipped and equipped.dps or nil
-
-        if candidateDPS and (not equippedDPS or candidateDPS > equippedDPS) then
-            result = {
-                kind = "Weapon",
-                candidateValue = candidateDPS,
-                equippedValue = equippedDPS or 0,
-            }
-        end
-    end
+    local candidateValue = GetWeightedValue(candidate.link, candidate.classID)
+    if not candidateValue then return nil end
+    if equipped and equipped.value == nil then return nil end
+    local equippedValue = equipped and equipped.value or 0
+    if equipped and candidateValue <= equippedValue then return nil end
+    local result = {candidateValue = candidateValue, equippedValue = equippedValue}
 
     if result then
         result.item = candidate
@@ -250,7 +293,16 @@ local function MakeUpgrade(candidate, equipped, bag, bagSlot, equipSlot)
 end
 
 local function QueueUpgrade(upgrade)
-    local identity = GetItemIdentity(upgrade.item.link, upgrade.item.itemID) .. ":" .. upgrade.equipSlot
+    local identity
+    if upgrade.weaponLoadout or upgrade.pairedLoadout then
+        identity = (upgrade.weaponLoadout and "weapon:" or "pair:")
+            .. (upgrade.pairedLoadout and tostring(upgrade.firstSlot) .. ":" or "")
+            .. (upgrade.main and upgrade.main.link or "")
+            .. ":" .. (upgrade.off and upgrade.off.link or "")
+    else
+        identity = GetItemIdentity(upgrade.item.link, upgrade.item.itemID)
+            .. ":" .. upgrade.equipSlot
+    end
 
     if promptedItems[identity] or queuedIdentities[identity] then
         return
@@ -260,6 +312,155 @@ local function QueueUpgrade(upgrade)
     upgrade.identity = identity
     upgradeQueue[#upgradeQueue + 1] = upgrade
 end
+
+local STAT_LABELS = {
+    RESISTANCE0_NAME = "Armor",
+    ITEM_MOD_DAMAGE_PER_SECOND_SHORT = "Weapon DPS",
+    ITEM_MOD_STAMINA_SHORT = "Stamina",
+    ITEM_MOD_STRENGTH_SHORT = "Strength",
+    ITEM_MOD_INTELLECT_SHORT = "Intellect",
+    ITEM_MOD_AGILITY_SHORT = "Agility",
+    ITEM_MOD_CRIT_RATING_SHORT = "Critical Strike",
+    ITEM_MOD_HASTE_RATING_SHORT = "Haste",
+    ITEM_MOD_SPIRIT_SHORT = "Spirit",
+    ITEM_MOD_POWER_REGEN0_SHORT = "MP5",
+    ITEM_MOD_MANA_REGENERATION_SHORT = "MP5",
+    ITEM_MOD_SPELL_POWER_SHORT = "Spell Power",
+    ITEM_MOD_SPELL_DAMAGE_DONE_SHORT = "Spell Damage",
+    ITEM_MOD_SPELL_DAMAGE_DONE = "Spell Damage",
+    ITEM_MOD_SPELL_HEALING_DONE_SHORT = "Spell Healing",
+    ITEM_MOD_SPELL_HEALING_DONE = "Spell Healing",
+}
+
+local STAT_ORDER = {
+    "Armor", "Weapon DPS", "Stamina", "Strength", "Intellect",
+    "Agility", "Critical Strike", "Haste", "Spirit", "MP5",
+    "Spell Damage", "Spell Healing", "Spell Power",
+}
+
+local function GetDisplayStats(item)
+    local result = {}
+    if not item then return result end
+    for key, value in pairs(C_Item.GetItemStats(item.link) or {}) do
+        if type(value) == "number" and value ~= 0 then
+            local label = STAT_LABELS[key]
+            if not label then
+                label = key:gsub("^ITEM_MOD_", ""):gsub("_SHORT$", "")
+                    :gsub("_", " "):lower():gsub("^%l", string.upper)
+            end
+            -- Short and long aliases can describe the same stat.
+            if result[label] == nil or value > result[label] then
+                result[label] = value
+            end
+        end
+    end
+    if item.classID == WEAPON_CLASS_ID then
+        local dps = GetWeaponDPS(item.link)
+        if dps then result["Weapon DPS"] = dps end
+    end
+    return result
+end
+
+local prompt = CreateFrame("Frame", "TailorUpgradePrompt", UIParent, "BackdropTemplate")
+prompt:SetSize(600, 300)
+prompt:SetPoint("CENTER")
+prompt:SetFrameStrata("DIALOG")
+prompt:SetMovable(true)
+prompt:SetClampedToScreen(true)
+prompt:RegisterForDrag("LeftButton")
+prompt:SetScript("OnDragStart", prompt.StartMoving)
+prompt:SetScript("OnDragStop", prompt.StopMovingOrSizing)
+prompt:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    edgeSize = 24,
+    insets = {left = 7, right = 7, top = 7, bottom = 7},
+})
+prompt:EnableMouse(true)
+prompt:Hide()
+tinsert(UISpecialFrames, "TailorUpgradePrompt")
+local promptTitle = prompt:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+promptTitle:SetPoint("TOP", 0, -20)
+promptTitle:SetText("Tailor - Upgrade Found")
+local scroll = CreateFrame("ScrollFrame", "TailorUpgradeScroll", prompt,
+    "UIPanelScrollFrameTemplate")
+scroll:SetPoint("TOPLEFT", 26, -80)
+scroll:SetPoint("BOTTOMRIGHT", -48, 65)
+local scrollChild = CreateFrame("Frame", nil, scroll)
+scrollChild:SetWidth(500)
+scrollChild:SetHeight(1)
+scroll:SetScrollChild(scrollChild)
+local equippedHeader = prompt:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+equippedHeader:SetPoint("BOTTOMLEFT", scroll, "TOPLEFT", 0, 5)
+equippedHeader:SetText("Equipped Item(s)")
+local upgradeHeader = prompt:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+upgradeHeader:SetPoint("LEFT", equippedHeader, 260, 0)
+upgradeHeader:SetText("Upgrade Item(s)")
+local rows = {}
+local function SetRow(index, label, equippedText, upgradeText)
+    local row = rows[index]
+    if not row then
+        row = {}
+        for column = 1, 2 do
+            local text = scrollChild:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+            text:SetPoint("TOPLEFT", (column - 1) * 260, -(index - 1) * 23)
+            text:SetSize(250, 21)
+            text:SetJustifyH("LEFT")
+            row[column] = text
+        end
+        rows[index] = row
+    end
+    row[1]:SetText(label .. ": " .. equippedText)
+    row[1]:SetTextColor(1, 1, 1)
+    row[2]:SetText(label .. ": " .. upgradeText)
+    row[2]:SetTextColor(1, 1, 1)
+    row[1]:Show()
+    row[2]:Show()
+end
+local function FormatNumber(value, decimals)
+    local formatted = string.format("%." .. decimals .. "f", value or 0)
+    if decimals > 0 then
+        formatted = formatted:gsub("0+$", ""):gsub("%.$", "")
+    end
+    return formatted
+end
+local function WithDifference(old, new, decimals)
+    local difference = new - old
+    local displayDifference = FormatNumber(difference, decimals)
+    if tonumber(displayDifference) == 0 then
+        return FormatNumber(new, decimals)
+    end
+    local sign = difference > 0 and "+" or ""
+    local color = difference > 0 and "|cff33ff33" or "|cffff4444"
+    return FormatNumber(new, decimals) .. " " .. color
+        .. "(" .. sign .. displayDifference .. ")|r"
+end
+local function QualityName(item, fallback)
+    if not item then return fallback end
+    if item.quality then
+        return string.format("|cnIQ%d:%s|r", item.quality, item.name)
+    end
+    return item.name
+end
+local function CombinedStats(main, off)
+    local combined = GetDisplayStats(main)
+    for name, value in pairs(GetDisplayStats(off)) do
+        combined[name] = (combined[name] or 0) + value
+    end
+    return combined
+end
+local equipButton = CreateFrame("Button", nil, prompt, "UIPanelButtonTemplate")
+equipButton:SetSize(110, 25)
+equipButton:SetPoint("BOTTOM", -125, 22)
+equipButton:SetText("Equip")
+local optionsButton = CreateFrame("Button", nil, prompt, "UIPanelButtonTemplate")
+optionsButton:SetSize(110, 25)
+optionsButton:SetPoint("BOTTOM", 0, 22)
+optionsButton:SetText("Options")
+local ignoreButton = CreateFrame("Button", nil, prompt, "UIPanelButtonTemplate")
+ignoreButton:SetSize(110, 25)
+ignoreButton:SetPoint("BOTTOM", 125, 22)
+ignoreButton:SetText("Ignore")
 
 local function ShowNextUpgrade()
     if currentUpgrade or #upgradeQueue == 0 then
@@ -271,55 +472,249 @@ local function ShowNextUpgrade()
     promptedItems[currentUpgrade.identity] = true
 
     local upgrade = currentUpgrade
-    local currentName = upgrade.equipped and upgrade.equipped.name or "Nothing equipped"
-
-    if upgrade.kind == "Armor" then
-        StaticPopupDialogs["BAG_UPGRADE_FOUND"].text = string.format(
-            "Bag Upgrade Found!\n\n%s\n\nArmor: %d -> %d\nCurrent: %s",
-            upgrade.item.name,
-            upgrade.equippedValue,
-            upgrade.candidateValue,
-            currentName
-        )
-    else
-        StaticPopupDialogs["BAG_UPGRADE_FOUND"].text = string.format(
-            "Bag Upgrade Found!\n\n%s\n\nDPS: %.1f -> %.1f\nCurrent: %s",
-            upgrade.item.name,
-            upgrade.equippedValue,
-            upgrade.candidateValue,
-            currentName
-        )
+    local equippedStats = upgrade.weaponLoadout
+        and CombinedStats(upgrade.equipped, upgrade.equippedOff)
+        or upgrade.pairedLoadout
+            and CombinedStats(upgrade.equipped, upgrade.equippedOff)
+        or GetDisplayStats(upgrade.equipped)
+    local upgradeStats = upgrade.weaponLoadout
+        and CombinedStats(upgrade.main, upgrade.off)
+        or upgrade.pairedLoadout
+            and CombinedStats(upgrade.main, upgrade.off)
+        or GetDisplayStats(upgrade.item)
+    SetRow(1, "Item Name",
+        QualityName(upgrade.equipped, "Nothing equipped"),
+        QualityName((upgrade.weaponLoadout or upgrade.pairedLoadout)
+            and upgrade.main or upgrade.item, "Empty"))
+    local valueRow = 2
+    if upgrade.weaponLoadout or upgrade.pairedLoadout then
+        SetRow(2, upgrade.weaponLoadout and "Off Hand" or "Second Slot",
+            QualityName(upgrade.equippedOff, "Empty"),
+            QualityName(upgrade.off, "Empty"))
+        valueRow = 3
     end
-
-    StaticPopup_Show("BAG_UPGRADE_FOUND")
+    SetRow(valueRow, "Weighted Value", FormatNumber(upgrade.equippedValue, 2),
+        WithDifference(upgrade.equippedValue, upgrade.candidateValue, 2))
+    local names, seen = {}, {}
+    for _, name in ipairs(STAT_ORDER) do
+        if equippedStats[name] or upgradeStats[name] then
+            names[#names + 1] = name
+            seen[name] = true
+        end
+    end
+    local extras = {}
+    for name in pairs(equippedStats) do
+        if not seen[name] then extras[name] = true end
+    end
+    for name in pairs(upgradeStats) do
+        if not seen[name] then extras[name] = true end
+    end
+    local sortedExtras = {}
+    for name in pairs(extras) do sortedExtras[#sortedExtras + 1] = name end
+    table.sort(sortedExtras)
+    for _, name in ipairs(sortedExtras) do names[#names + 1] = name end
+    for index, name in ipairs(names) do
+        local old, new = equippedStats[name] or 0, upgradeStats[name] or 0
+        SetRow(index + valueRow, name, FormatNumber(old, 1),
+            WithDifference(old, new, 1))
+    end
+    for index = #names + valueRow + 1, #rows do
+        rows[index][1]:Hide()
+        rows[index][2]:Hide()
+    end
+    local rowCount = #names + valueRow
+    local gap = 48 -- roughly half an inch at a typical UI scale
+    local leftWidth, rightWidth = 220, 220
+    for index = 1, rowCount do
+        leftWidth = math.max(leftWidth, rows[index][1]:GetUnboundedStringWidth() + 8)
+        rightWidth = math.max(rightWidth, rows[index][2]:GetUnboundedStringWidth() + 8)
+    end
+    local availableWidth = math.max(440, UIParent:GetWidth() - 130 - gap)
+    local columnWidth = math.min(math.max(leftWidth, rightWidth),
+        availableWidth / 2)
+    scrollChild:SetWidth(columnWidth * 2 + gap)
+    scrollChild:SetHeight(math.max(1, rowCount * 23))
+    for index = 1, rowCount do
+        for column = 1, 2 do
+            local text = rows[index][column]
+            text:ClearAllPoints()
+            text:SetPoint("TOPLEFT", scrollChild, "TOPLEFT",
+                (column - 1) * (columnWidth + gap), -(index - 1) * 23)
+            text:SetWidth(columnWidth)
+        end
+    end
+    upgradeHeader:ClearAllPoints()
+    upgradeHeader:SetPoint("LEFT", equippedHeader, columnWidth + gap, 0)
+    prompt:SetSize(columnWidth * 2 + gap + 74,
+        math.min(math.max(220, rowCount * 23 + 145),
+            math.max(220, UIParent:GetHeight() - 60)))
+    scroll:SetVerticalScroll(0)
+    prompt:Show()
 end
 
-StaticPopupDialogs["BAG_UPGRADE_FOUND"] = {
-    text = "Bag Upgrade Found!",
-    button1 = "Equip",
-    button2 = "Ignore",
-
-    OnAccept = function()
-        local upgrade = currentUpgrade
-        currentUpgrade = nil
-
-        if upgrade then
+equipButton:SetScript("OnClick", function()
+    local upgrade = currentUpgrade
+    currentUpgrade = nil
+    prompt:Hide()
+    if upgrade then
+        if upgrade.weaponLoadout or upgrade.pairedLoadout then
+            local firstSlot = upgrade.pairedLoadout and upgrade.firstSlot or 16
+            local secondSlot = upgrade.pairedLoadout and upgrade.secondSlot or 17
+            if upgrade.main and upgrade.main.fromBag then
+                C_Item.EquipItemByName(upgrade.main.link, firstSlot)
+            end
+            if upgrade.off and upgrade.off.fromBag then
+                C_Item.EquipItemByName(upgrade.off.link, secondSlot)
+            end
+        else
             C_Item.EquipItemByName(upgrade.item.link, upgrade.equipSlot)
         end
+    end
+    C_Timer.After(0.1, ShowNextUpgrade)
+end)
 
-        C_Timer.After(0.1, ShowNextUpgrade)
-    end,
+ignoreButton:SetScript("OnClick", function()
+    currentUpgrade = nil
+    prompt:Hide()
+    C_Timer.After(0.1, ShowNextUpgrade)
+end)
 
-    OnCancel = function()
+prompt:SetScript("OnHide", function()
+    if currentUpgrade then
         currentUpgrade = nil
         C_Timer.After(0.1, ShowNextUpgrade)
-    end,
+    end
+end)
 
-    timeout = 0,
-    whileDead = false,
-    hideOnEscape = true,
-    preferredIndex = 3,
-}
+local function FindBestWeaponLoadout(pool, equippedMain, equippedOff)
+    local dualWield = CanDualWield and CanDualWield() or false
+    -- A two-handed main hand occupies both slots. One-handed off-hand weapons
+    -- need Dual Wield; shields remain eligible without it.
+    local currentValue = (equippedMain and equippedMain.value or 0)
+        + (equippedOff and equippedOff.value or 0)
+    if (equippedMain and equippedMain.value == nil)
+        or (equippedOff and equippedOff.value == nil) then
+        return nil
+    end
+
+    local mainOptions, offOptions = {}, {false}
+    if equippedMain then mainOptions[#mainOptions + 1] = equippedMain end
+    if not equippedMain then mainOptions[#mainOptions + 1] = false end
+    if equippedOff then offOptions[#offOptions + 1] = equippedOff end
+    for _, item in ipairs(pool) do
+        if item.value then
+            local loc = item.equipLoc
+            if loc == "INVTYPE_WEAPON" or loc == "INVTYPE_WEAPONMAINHAND"
+                or loc == "INVTYPE_2HWEAPON" or loc == "INVTYPE_RANGED"
+                or loc == "INVTYPE_RANGEDRIGHT" or loc == "INVTYPE_THROWN" then
+                mainOptions[#mainOptions + 1] = item
+            end
+            if loc == "INVTYPE_SHIELD" or loc == "INVTYPE_HOLDABLE"
+                or (dualWield and (loc == "INVTYPE_WEAPON"
+                    or loc == "INVTYPE_WEAPONOFFHAND")) then
+                offOptions[#offOptions + 1] = item
+            end
+        end
+    end
+
+    local best
+    for _, main in ipairs(mainOptions) do
+        local twoHanded = main and (main.equipLoc == "INVTYPE_2HWEAPON"
+            or main.equipLoc == "INVTYPE_RANGED"
+            or main.equipLoc == "INVTYPE_RANGEDRIGHT")
+        for _, off in ipairs(offOptions) do
+            local valid = (not twoHanded or not off)
+                and (off or not equippedOff or twoHanded)
+                and (not off or dualWield or off.equipLoc == "INVTYPE_SHIELD"
+                    or off.equipLoc == "INVTYPE_HOLDABLE"
+                    or (off == equippedOff and off.classID ~= WEAPON_CLASS_ID))
+                and (not off or not (main and main.fromBag and off.fromBag
+                    and main.bag == off.bag and main.bagSlot == off.bagSlot))
+                and ((main and main.fromBag) or (off and off.fromBag))
+            if valid then
+                local value = (main and main.value or 0) + (off and off.value or 0)
+                local filled = (main and 1 or 0) + (off and 1 or 0)
+                local currentFilled = (equippedMain and 1 or 0)
+                    + (equippedOff and 1 or 0)
+                if (value > currentValue
+                    or (value == currentValue and filled > currentFilled))
+                    and (not best or value > best.candidateValue
+                        or (value == best.candidateValue and filled > best.filled)) then
+                    best = {
+                        weaponLoadout = true,
+                        item = main and main.fromBag and main or off,
+                        main = main or nil,
+                        off = off or nil,
+                        equipped = equippedMain,
+                        equippedOff = equippedOff,
+                        candidateValue = value,
+                        equippedValue = currentValue,
+                        filled = filled,
+                    }
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function FindBestPairedLoadout(pool, firstSlot, secondSlot)
+    local currentFirst = GetEquippedItem(firstSlot)
+    local currentSecond = GetEquippedItem(secondSlot)
+    if (currentFirst and currentFirst.value == nil)
+        or (currentSecond and currentSecond.value == nil) then return nil end
+    local baseline = (currentFirst and currentFirst.value or 0)
+        + (currentSecond and currentSecond.value or 0)
+    local baselineFilled = (currentFirst and 1 or 0)
+        + (currentSecond and 1 or 0)
+    local firstOptions, secondOptions = {}, {}
+    if currentFirst then
+        firstOptions[#firstOptions + 1] = currentFirst
+    else
+        firstOptions[#firstOptions + 1] = false
+    end
+    if currentSecond then
+        secondOptions[#secondOptions + 1] = currentSecond
+    else
+        secondOptions[#secondOptions + 1] = false
+    end
+    for _, item in ipairs(pool) do
+        if item.value ~= nil then
+            firstOptions[#firstOptions + 1] = item
+            secondOptions[#secondOptions + 1] = item
+        end
+    end
+    local best
+    for _, first in ipairs(firstOptions) do
+        for _, second in ipairs(secondOptions) do
+            if (not first or not second or not (first.fromBag and second.fromBag
+                and first.bag == second.bag and first.bagSlot == second.bagSlot))
+                and ((first and first.fromBag) or (second and second.fromBag)) then
+                local value = (first and first.value or 0)
+                    + (second and second.value or 0)
+                local filled = (first and 1 or 0) + (second and 1 or 0)
+                if (value > baseline or (value == baseline and filled > baselineFilled))
+                    and (not best or value > best.candidateValue
+                        or (value == best.candidateValue and filled > best.filled)) then
+                    best = {
+                        pairedLoadout = true,
+                        firstSlot = firstSlot,
+                        secondSlot = secondSlot,
+                        item = first and first.fromBag and first or second,
+                        main = first or nil,
+                        off = second or nil,
+                        equipped = currentFirst,
+                        equippedOff = currentSecond,
+                        candidateValue = value,
+                        equippedValue = baseline,
+                        filled = filled,
+                    }
+                end
+            end
+        end
+    end
+    return best
+end
 
 local function ScanBags()
     if scanning then
@@ -333,6 +728,8 @@ local function ScanBags()
     local pending = 1
     local bestBySlot = {}
     local equippedBySlot = {}
+    local weaponPool = {}
+    local fingerPool, trinketPool = {}, {}
 
     local function FinishItem()
         pending = pending - 1
@@ -353,6 +750,14 @@ local function ScanBags()
             local upgrade = bestBySlot[slot]
             if upgrade then QueueUpgrade(upgrade) end
         end
+        local main = GetEquippedItem(16)
+        local off = GetEquippedItem(17)
+        local weaponUpgrade = FindBestWeaponLoadout(weaponPool, main, off)
+        if weaponUpgrade then QueueUpgrade(weaponUpgrade) end
+        local fingerUpgrade = FindBestPairedLoadout(fingerPool, 11, 12)
+        if fingerUpgrade then QueueUpgrade(fingerUpgrade) end
+        local trinketUpgrade = FindBestPairedLoadout(trinketPool, 13, 14)
+        if trinketUpgrade then QueueUpgrade(trinketUpgrade) end
         ShowNextUpgrade()
     end
 
@@ -370,28 +775,53 @@ local function ScanBags()
                     local current = C_Container.GetContainerItemInfo(bagIndex, bagSlot)
                     if current and current.itemID == itemID
                         and (not itemLink or current.hyperlink == itemLink) then
-                        local slotsForItem = GetCandidateSlots(candidate.equipLoc)
-                        if slotsForItem then
-                            local bestForItem
-                            for _, equipSlot in ipairs(slotsForItem) do
-                                if equippedBySlot[equipSlot] == nil then
-                                    equippedBySlot[equipSlot] = GetEquippedItem(equipSlot) or false
-                                end
-                                local equipped = equippedBySlot[equipSlot]
-                                local upgrade = MakeUpgrade(candidate,
-                                    equipped or nil, bagIndex, bagSlot, equipSlot)
-                                if upgrade and (not bestForItem
-                                    or upgrade.candidateValue - upgrade.equippedValue
-                                        > bestForItem.candidateValue - bestForItem.equippedValue) then
-                                    bestForItem = upgrade
-                                end
+                        if (candidate.classID == WEAPON_CLASS_ID
+                                and WEAPON_EQUIP_LOCS[candidate.equipLoc])
+                            or candidate.equipLoc == "INVTYPE_SHIELD"
+                            or candidate.equipLoc == "INVTYPE_HOLDABLE" then
+                            if C_Item.IsEquippableItem(candidate.link) then
+                                candidate.value = GetWeightedValue(candidate.link,
+                                    candidate.classID)
+                                candidate.fromBag = true
+                                candidate.bag = bagIndex
+                                candidate.bagSlot = bagSlot
+                                weaponPool[#weaponPool + 1] = candidate
                             end
-                            if bestForItem then
-                                local equipSlot = bestForItem.equipSlot
-                                local previous = bestBySlot[equipSlot]
-                                -- Compare the absolute armor/DPS value for this slot.
-                                if not previous or bestForItem.candidateValue > previous.candidateValue then
-                                    bestBySlot[equipSlot] = bestForItem
+                        elseif candidate.equipLoc == "INVTYPE_FINGER"
+                            or candidate.equipLoc == "INVTYPE_TRINKET" then
+                            if C_Item.IsEquippableItem(candidate.link) then
+                                candidate.value = GetWeightedValue(candidate.link,
+                                    candidate.classID)
+                                candidate.fromBag = true
+                                candidate.bag = bagIndex
+                                candidate.bagSlot = bagSlot
+                                local pool = candidate.equipLoc == "INVTYPE_FINGER"
+                                    and fingerPool or trinketPool
+                                pool[#pool + 1] = candidate
+                            end
+                        else
+                            local slotsForItem = GetCandidateSlots(candidate.equipLoc)
+                            if slotsForItem then
+                                local bestForItem
+                                for _, equipSlot in ipairs(slotsForItem) do
+                                    if equippedBySlot[equipSlot] == nil then
+                                        equippedBySlot[equipSlot] = GetEquippedItem(equipSlot) or false
+                                    end
+                                    local equipped = equippedBySlot[equipSlot]
+                                    local upgrade = MakeUpgrade(candidate,
+                                        equipped or nil, bagIndex, bagSlot, equipSlot)
+                                    if upgrade and (not bestForItem
+                                        or upgrade.candidateValue - upgrade.equippedValue
+                                            > bestForItem.candidateValue - bestForItem.equippedValue) then
+                                        bestForItem = upgrade
+                                    end
+                                end
+                                if bestForItem then
+                                    local equipSlot = bestForItem.equipSlot
+                                    local previous = bestBySlot[equipSlot]
+                                    if not previous or bestForItem.candidateValue > previous.candidateValue then
+                                        bestBySlot[equipSlot] = bestForItem
+                                    end
                                 end
                             end
                         end
@@ -418,6 +848,71 @@ local function QueueScan()
     end)
 end
 
+local optionsPanel = CreateFrame("Frame", "TailorOptionsPanel", UIParent)
+optionsPanel.name = "Tailor"
+optionsPanel:SetSize(520, 580)
+local title = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+title:SetPoint("TOPLEFT", 20, -20)
+title:SetText("Tailor - Stat Weights")
+local description = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+description:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -10)
+description:SetText("Weighted value = sum of each item's stats multiplied by these weights.")
+local optionsDirty = false
+local returnToScanFromOptions = false
+
+for index, entry in ipairs(WEIGHTS) do
+    local key, label = entry[1], entry[2]
+    local slider = CreateFrame("Slider", "TailorWeightSlider" .. index,
+        optionsPanel, "OptionsSliderTemplate")
+    slider:SetPoint("TOPLEFT", 28, -88 - (index - 1) * 40)
+    slider:SetSize(285, 17)
+    slider:SetMinMaxValues(0, 1)
+    slider:SetValueStep(0.01)
+    slider:SetObeyStepOnDrag(true)
+    local name = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    name:SetPoint("BOTTOMLEFT", slider, "TOPLEFT", 0, 2)
+    name:SetText(label)
+    local number = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    number:SetPoint("LEFT", slider, "RIGHT", 18, 0)
+    slider:SetScript("OnValueChanged", function(self, value)
+        value = math.floor(value * 100 + 0.5) / 100
+        number:SetText(string.format("%.2f", value))
+        if TailorDB.weights[key] ~= value then
+            TailorDB.weights[key] = value
+            optionsDirty = true
+        end
+    end)
+    slider:SetValue(TailorDB.weights[key])
+end
+
+optionsPanel:SetScript("OnHide", function()
+    if not optionsDirty and not returnToScanFromOptions then return end
+    returnToScanFromOptions = false
+    if optionsDirty then
+        wipe(promptedItems)
+    end
+    optionsDirty = false
+    wipe(upgradeQueue)
+    wipe(queuedIdentities)
+    if currentUpgrade then
+        currentUpgrade = nil
+        prompt:Hide()
+    end
+    QueueScan()
+end)
+
+local optionsCategory = Settings.RegisterCanvasLayoutCategory(optionsPanel, "Tailor")
+Settings.RegisterAddOnCategory(optionsCategory)
+optionsButton:SetScript("OnClick", function()
+    if currentUpgrade then
+        promptedItems[currentUpgrade.identity] = nil
+        currentUpgrade = nil
+    end
+    returnToScanFromOptions = true
+    prompt:Hide()
+    Settings.OpenToCategory(optionsCategory:GetID())
+end)
+
 SLASH_BAGUPGRADE1 = "/tailor"
 
 SlashCmdList.BAGUPGRADE = function(msg)
@@ -430,19 +925,25 @@ SlashCmdList.BAGUPGRADE = function(msg)
         currentUpgrade = nil
         Print("Prompt history reset.")
         QueueScan()
+    elseif msg == "options" then
+        Settings.OpenToCategory(optionsCategory:GetID())
     else
-        Print("Scanning bags for armor and weapon upgrades...")
+        Print("Scanning bags for weighted upgrades...")
         QueueScan()
     end
 end
 
 Tailor:RegisterEvent("PLAYER_LOGIN")
 Tailor:RegisterEvent("BAG_UPDATE_DELAYED")
+Tailor:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 
-Tailor:SetScript("OnEvent", function(self, event)
+Tailor:SetScript("OnEvent", function(self, event, unit)
     if event == "PLAYER_LOGIN" then
         C_Timer.After(1.0, ScanBags)
     elseif event == "BAG_UPDATE_DELAYED" then
+        QueueScan()
+    elseif event == "PLAYER_SPECIALIZATION_CHANGED" and unit == "player" then
+        wipe(promptedItems)
         QueueScan()
     end
 end)
