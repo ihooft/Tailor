@@ -1,0 +1,8 @@
+## Interface: 100207
+## Title: Tailor
+## Notes: Automatically detects upgraded gear in your bags and prompts you to equip it.
+## Author: Isaac
+## Version: 1.1
+## SavedVariables: TailorIgnoredItems
+
+Tailor.lua
