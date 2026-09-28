@@ -38,7 +38,6 @@ end
 local ARMOR_EQUIP_LOCS = {
     INVTYPE_HEAD = true,
     INVTYPE_SHOULDER = true,
-    INVTYPE_CLOAK = true,
     INVTYPE_CHEST = true,
     INVTYPE_ROBE = true,
     INVTYPE_WRIST = true,
@@ -46,8 +45,38 @@ local ARMOR_EQUIP_LOCS = {
     INVTYPE_WAIST = true,
     INVTYPE_LEGS = true,
     INVTYPE_FEET = true,
-    INVTYPE_SHIELD = true,
 }
+
+-- Cloth = 1, leather = 2, mail = 3, plate = 4. Classes can also
+-- equip lower tiers, but cannot equip a tier above their proficiency.
+local MAX_ARMOR_SUBCLASS_BY_CLASS = {
+    WARRIOR = 4, PALADIN = 4, DEATHKNIGHT = 4,
+    HUNTER = 3, SHAMAN = 3, EVOKER = 3,
+    ROGUE = 2, DRUID = 2, MONK = 2, DEMONHUNTER = 2,
+    PRIEST = 1, MAGE = 1, WARLOCK = 1,
+}
+
+local function CanWearArmor(candidate)
+    if candidate.classID ~= ARMOR_CLASS_ID
+        or not ARMOR_EQUIP_LOCS[candidate.equipLoc] then
+        return true
+    end
+
+    local subclass = candidate.subclassID
+    if subclass == 0 then return true end -- Generic/cosmetic armor.
+    local _, classToken = UnitClass("player")
+    local maxSubclass = MAX_ARMOR_SUBCLASS_BY_CLASS[classToken]
+    return type(subclass) == "number" and subclass >= 1
+        and subclass <= 4 and maxSubclass ~= nil and subclass <= maxSubclass
+end
+
+local function CanEquipWeapon(candidate)
+    -- IsEquippableItem checks that the item fits equipment slots. CanUseItem
+    -- checks whether this character meets the item's equip requirements,
+    -- including its weapon or shield proficiency.
+    return C_Item.IsEquippableItem(candidate.link)
+        and C_PlayerInfo.CanUseItem(candidate.itemID)
+end
 
 local WEAPON_EQUIP_LOCS = {
     INVTYPE_WEAPON = true,
@@ -273,7 +302,8 @@ end
 
 local function MakeUpgrade(candidate, equipped, bag, bagSlot, equipSlot)
     if not GetCandidateSlots(candidate.equipLoc)
-        or not C_Item.IsEquippableItem(candidate.link) then return nil end
+        or not C_Item.IsEquippableItem(candidate.link)
+        or not CanWearArmor(candidate) then return nil end
 
     local candidateValue = GetWeightedValue(candidate.link, candidate.classID)
     if not candidateValue then return nil end
@@ -463,7 +493,7 @@ ignoreButton:SetPoint("BOTTOM", 125, 22)
 ignoreButton:SetText("Ignore")
 
 local function ShowNextUpgrade()
-    if currentUpgrade or #upgradeQueue == 0 then
+    if InCombatLockdown() or currentUpgrade or #upgradeQueue == 0 then
         return
     end
 
@@ -553,6 +583,7 @@ local function ShowNextUpgrade()
 end
 
 equipButton:SetScript("OnClick", function()
+    if InCombatLockdown() then return end
     local upgrade = currentUpgrade
     currentUpgrade = nil
     prompt:Hide()
@@ -716,6 +747,146 @@ local function FindBestPairedLoadout(pool, firstSlot, secondSlot)
     return best
 end
 
+local questHighlightGeneration = 0
+local questHighlightQueued = false
+
+local function GetComparisonItem(slot)
+    local item = GetEquippedItem(slot)
+    if GetInventoryItemLink("player", slot) and not item then
+        return nil, false -- Wait for the equipped item's data.
+    end
+    return item, true
+end
+
+local function IsQuestRewardUpgrade(candidate, rewardIndex)
+    if not GetCandidateSlots(candidate.equipLoc)
+        or not C_Item.IsEquippableItem(candidate.link)
+        or not C_PlayerInfo.CanUseItem(candidate.itemID)
+        or not CanWearArmor(candidate) then
+        return false
+    end
+
+    candidate.value = GetWeightedValue(candidate.link, candidate.classID)
+    if candidate.value == nil then return false end
+
+    -- A reward is a single item: use a unique synthetic bag position so the
+    -- loadout helpers cannot equip it twice in a paired slot.
+    candidate.fromBag = true
+    candidate.bag = -1
+    candidate.bagSlot = rewardIndex
+
+    if (candidate.classID == WEAPON_CLASS_ID
+            and WEAPON_EQUIP_LOCS[candidate.equipLoc])
+        or candidate.equipLoc == "INVTYPE_SHIELD"
+        or candidate.equipLoc == "INVTYPE_HOLDABLE" then
+        local main, mainReady = GetComparisonItem(16)
+        local off, offReady = GetComparisonItem(17)
+        return mainReady and offReady
+            and FindBestWeaponLoadout({candidate}, main, off) ~= nil
+    elseif candidate.equipLoc == "INVTYPE_FINGER" then
+        local first, firstReady = GetComparisonItem(11)
+        local second, secondReady = GetComparisonItem(12)
+        return firstReady and secondReady
+            and FindBestPairedLoadout({candidate}, 11, 12) ~= nil
+    elseif candidate.equipLoc == "INVTYPE_TRINKET" then
+        local first, firstReady = GetComparisonItem(13)
+        local second, secondReady = GetComparisonItem(14)
+        return firstReady and secondReady
+            and FindBestPairedLoadout({candidate}, 13, 14) ~= nil
+    end
+
+    for _, slot in ipairs(GetCandidateSlots(candidate.equipLoc)) do
+        local equipped, ready = GetComparisonItem(slot)
+        if ready and (not equipped or (equipped.value ~= nil
+            and candidate.value > equipped.value)) then
+            return true
+        end
+    end
+    return false
+end
+
+local function SetQuestRewardHighlight(button, visible)
+    if not button.TailorUpgradeBorder and visible then
+        local border = CreateFrame("Frame", nil, button)
+        border:SetAllPoints(button)
+        border:EnableMouse(false)
+        local function Edge(point1, point2, width, height)
+            local texture = border:CreateTexture(nil, "OVERLAY")
+            texture:SetColorTexture(0.20, 1.0, 0.25, 0.95)
+            texture:SetPoint(point1, border, point1)
+            if point2 then texture:SetPoint(point2, border, point2) end
+            if width then texture:SetWidth(width) end
+            if height then texture:SetHeight(height) end
+        end
+        Edge("TOPLEFT", "TOPRIGHT", nil, 2)
+        Edge("BOTTOMLEFT", "BOTTOMRIGHT", nil, 2)
+        Edge("TOPLEFT", "BOTTOMLEFT", 2)
+        Edge("TOPRIGHT", "BOTTOMRIGHT", 2)
+        button.TailorUpgradeBorder = border
+    end
+    if button.TailorUpgradeBorder then
+        button.TailorUpgradeBorder:SetShown(visible)
+    end
+end
+
+local function ClearQuestRewardHighlights()
+    local frame = QuestInfoFrame and QuestInfoFrame.rewardsFrame
+    if frame and frame.RewardButtons then
+        for _, button in ipairs(frame.RewardButtons) do
+            SetQuestRewardHighlight(button, false)
+        end
+    end
+end
+
+local function RefreshQuestRewardHighlights()
+    questHighlightGeneration = questHighlightGeneration + 1
+    local generation = questHighlightGeneration
+    ClearQuestRewardHighlights()
+    if not QuestFrameRewardPanel or not QuestFrameRewardPanel:IsShown()
+        or not QuestInfoFrame or QuestInfoFrame.questLog then return end
+
+    local frame = QuestInfoFrame.rewardsFrame
+    if not frame or not frame.RewardButtons then return end
+    local questID = GetQuestID()
+    for _, button in ipairs(frame.RewardButtons) do
+        if button:IsShown() and button.objectType == "item"
+            and (button.type == "choice" or button.type == "reward") then
+            local rewardType, rewardIndex = button.type, button:GetID()
+            local count = rewardType == "choice"
+                and GetNumQuestChoices() or GetNumQuestRewards()
+            local link = rewardIndex and rewardIndex >= 1
+                and rewardIndex <= count
+                and GetQuestItemLink(rewardType, rewardIndex)
+            if link then
+                local itemID = C_Item.GetItemInfoInstant(link)
+                if itemID then
+                    GetItemInfo(link, itemID, function(candidate)
+                        if generation == questHighlightGeneration
+                            and QuestFrameRewardPanel:IsShown()
+                            and GetQuestID() == questID
+                            and button:IsShown()
+                            and button.type == rewardType
+                            and button:GetID() == rewardIndex
+                            and GetQuestItemLink(rewardType, rewardIndex) == link then
+                            SetQuestRewardHighlight(button,
+                                IsQuestRewardUpgrade(candidate, rewardIndex))
+                        end
+                    end)
+                end
+            end
+        end
+    end
+end
+
+local function ScheduleQuestRewardHighlights()
+    if questHighlightQueued then return end
+    questHighlightQueued = true
+    C_Timer.After(0, function()
+        questHighlightQueued = false
+        RefreshQuestRewardHighlights()
+    end)
+end
+
 local function ScanBags()
     if scanning then
         scanQueued = true
@@ -774,12 +945,13 @@ local function ScanBags()
                     if generation ~= scanGeneration then return end
                     local current = C_Container.GetContainerItemInfo(bagIndex, bagSlot)
                     if current and current.itemID == itemID
-                        and (not itemLink or current.hyperlink == itemLink) then
+                        and (not itemLink or current.hyperlink == itemLink)
+                        and CanWearArmor(candidate) then
                         if (candidate.classID == WEAPON_CLASS_ID
                                 and WEAPON_EQUIP_LOCS[candidate.equipLoc])
                             or candidate.equipLoc == "INVTYPE_SHIELD"
                             or candidate.equipLoc == "INVTYPE_HOLDABLE" then
-                            if C_Item.IsEquippableItem(candidate.link) then
+                            if CanEquipWeapon(candidate) then
                                 candidate.value = GetWeightedValue(candidate.link,
                                     candidate.classID)
                                 candidate.fromBag = true
@@ -899,6 +1071,7 @@ optionsPanel:SetScript("OnHide", function()
         prompt:Hide()
     end
     QueueScan()
+    ScheduleQuestRewardHighlights()
 end)
 
 local optionsCategory = Settings.RegisterCanvasLayoutCategory(optionsPanel, "Tailor")
@@ -933,17 +1106,60 @@ SlashCmdList.BAGUPGRADE = function(msg)
     end
 end
 
+local rewardHooksInstalled = false
+local rewardPanelHooked = false
+local function InstallQuestRewardHooks()
+    if not rewardHooksInstalled and QuestInfo_ShowRewards then
+        hooksecurefunc("QuestInfo_ShowRewards", ScheduleQuestRewardHighlights)
+        rewardHooksInstalled = true
+    end
+    if not rewardPanelHooked and QuestFrameRewardPanel then
+        QuestFrameRewardPanel:HookScript("OnShow", ScheduleQuestRewardHighlights)
+        QuestFrameRewardPanel:HookScript("OnHide", function()
+            questHighlightGeneration = questHighlightGeneration + 1
+            ClearQuestRewardHighlights()
+        end)
+        rewardPanelHooked = true
+    end
+end
+
 Tailor:RegisterEvent("PLAYER_LOGIN")
+Tailor:RegisterEvent("ADDON_LOADED")
 Tailor:RegisterEvent("BAG_UPDATE_DELAYED")
 Tailor:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+Tailor:RegisterEvent("PLAYER_REGEN_DISABLED")
+Tailor:RegisterEvent("PLAYER_REGEN_ENABLED")
+Tailor:RegisterEvent("QUEST_COMPLETE")
+Tailor:RegisterEvent("QUEST_ITEM_UPDATE")
+Tailor:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 
 Tailor:SetScript("OnEvent", function(self, event, unit)
     if event == "PLAYER_LOGIN" then
+        InstallQuestRewardHooks()
         C_Timer.After(1.0, ScanBags)
+    elseif event == "ADDON_LOADED" and unit == "Blizzard_UIPanels_Game" then
+        InstallQuestRewardHooks()
     elseif event == "BAG_UPDATE_DELAYED" then
         QueueScan()
     elseif event == "PLAYER_SPECIALIZATION_CHANGED" and unit == "player" then
         wipe(promptedItems)
+        QueueScan()
+        ScheduleQuestRewardHighlights()
+    elseif event == "QUEST_COMPLETE" or event == "QUEST_ITEM_UPDATE"
+        or event == "PLAYER_EQUIPMENT_CHANGED" then
+        ScheduleQuestRewardHighlights()
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        if currentUpgrade then
+            -- Put the interrupted prompt back before hiding it. Its identity
+            -- must be eligible again when the post-combat scan finishes.
+            local upgrade = currentUpgrade
+            currentUpgrade = nil
+            promptedItems[upgrade.identity] = nil
+            queuedIdentities[upgrade.identity] = true
+            table.insert(upgradeQueue, 1, upgrade)
+            prompt:Hide()
+        end
+    elseif event == "PLAYER_REGEN_ENABLED" then
         QueueScan()
     end
 end)
