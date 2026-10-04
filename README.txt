@@ -1,14 +1,14 @@
 Tailor
 ===========
 
-Retail WoW addon for Midnight 12.1.x.
-
 Behavior:
 - Scans the player's equipped bags on PLAYER_LOGIN.
 - Re-scans after BAG_UPDATE_DELAYED.
 - Scores armor and weapons with adjustable 0.00-1.00 weights for Armor, Weapon DPS,
   Stamina, Strength, Intellect, Agility, Critical Strike, Haste, Spirit, MP5,
-  Spell Damage, and Spell Healing.
+  Spell Damage, Spell Healing, Defense, Dodge, Block, and Parry.
+- Defense, Dodge, Block, and Parry evaluate item ratings; Block uses block rating,
+  rather than shield block value. Weight sliders use two columns.
 - Armor and Weapon DPS default to 1.00; other weights default to 0.00.
 - Stat weights are saved per character and restored before the options sliders
   are initialized on login or /reload.
@@ -45,6 +45,3 @@ Install:
 1. Extract the Tailor folder into:
    World of Warcraft/_retail_/Interface/AddOns/
 2. Restart WoW or type /reload.
-
-Current live Retail interface:
-12.1.0 / interface 120100.

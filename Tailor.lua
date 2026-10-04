@@ -27,6 +27,10 @@ local WEIGHTS = {
     {"mp5", "MP5", 0},
     {"spellDamage", "Spell Damage", 0},
     {"spellHealing", "Spell Healing", 0},
+    {"defense", "Defense", 0},
+    {"dodge", "Dodge", 0},
+    {"block", "Block", 0},
+    {"parry", "Parry", 0},
 }
 
 TailorDB.weights = TailorDB.weights or {}
@@ -154,7 +158,15 @@ local function GetWeightedValue(itemLink, classID)
     local function Stat(key)
         return tonumber(stats[key]) or 0
     end
-    local total = Stat("ITEM_MOD_STAMINA_SHORT") * w.stamina
+    local function Rating(key)
+        -- Some clients expose both aliases; count each rating only once.
+        return math.max(Stat(key .. "_SHORT"), Stat(key))
+    end
+    local total = Rating("ITEM_MOD_DEFENSE_SKILL_RATING") * w.defense
+        + Rating("ITEM_MOD_DODGE_RATING") * w.dodge
+        + Rating("ITEM_MOD_BLOCK_RATING") * w.block
+        + Rating("ITEM_MOD_PARRY_RATING") * w.parry
+        + Stat("ITEM_MOD_STAMINA_SHORT") * w.stamina
         + Stat("ITEM_MOD_STRENGTH_SHORT") * w.strength
         + Stat("ITEM_MOD_INTELLECT_SHORT") * w.intellect
         + Stat("ITEM_MOD_AGILITY_SHORT") * w.agility
@@ -344,6 +356,14 @@ local function QueueUpgrade(upgrade)
 end
 
 local STAT_LABELS = {
+    ITEM_MOD_PARRY_RATING_SHORT = "Parry",
+    ITEM_MOD_PARRY_RATING = "Parry",
+    ITEM_MOD_BLOCK_RATING_SHORT = "Block",
+    ITEM_MOD_BLOCK_RATING = "Block",
+    ITEM_MOD_DODGE_RATING_SHORT = "Dodge",
+    ITEM_MOD_DODGE_RATING = "Dodge",
+    ITEM_MOD_DEFENSE_SKILL_RATING_SHORT = "Defense",
+    ITEM_MOD_DEFENSE_SKILL_RATING = "Defense",
     RESISTANCE0_NAME = "Armor",
     ITEM_MOD_DAMAGE_PER_SECOND_SHORT = "Weapon DPS",
     ITEM_MOD_STAMINA_SHORT = "Stamina",
@@ -366,6 +386,7 @@ local STAT_ORDER = {
     "Armor", "Weapon DPS", "Stamina", "Strength", "Intellect",
     "Agility", "Critical Strike", "Haste", "Spirit", "MP5",
     "Spell Damage", "Spell Healing", "Spell Power",
+    "Defense", "Dodge", "Block", "Parry",
 }
 
 local function GetDisplayStats(item)
@@ -758,16 +779,16 @@ local function GetComparisonItem(slot)
     return item, true
 end
 
-local function IsQuestRewardUpgrade(candidate, rewardIndex)
+local function GetQuestRewardUpgradeGain(candidate, rewardIndex)
     if not GetCandidateSlots(candidate.equipLoc)
         or not C_Item.IsEquippableItem(candidate.link)
         or not C_PlayerInfo.CanUseItem(candidate.itemID)
         or not CanWearArmor(candidate) then
-        return false
+        return nil
     end
 
     candidate.value = GetWeightedValue(candidate.link, candidate.classID)
-    if candidate.value == nil then return false end
+    if candidate.value == nil then return nil end
 
     -- A reward is a single item: use a unique synthetic bag position so the
     -- loadout helpers cannot equip it twice in a paired slot.
@@ -775,35 +796,44 @@ local function IsQuestRewardUpgrade(candidate, rewardIndex)
     candidate.bag = -1
     candidate.bagSlot = rewardIndex
 
+    local upgrade
     if (candidate.classID == WEAPON_CLASS_ID
             and WEAPON_EQUIP_LOCS[candidate.equipLoc])
         or candidate.equipLoc == "INVTYPE_SHIELD"
         or candidate.equipLoc == "INVTYPE_HOLDABLE" then
         local main, mainReady = GetComparisonItem(16)
         local off, offReady = GetComparisonItem(17)
-        return mainReady and offReady
-            and FindBestWeaponLoadout({candidate}, main, off) ~= nil
+        if mainReady and offReady then
+            upgrade = FindBestWeaponLoadout({candidate}, main, off)
+        end
     elseif candidate.equipLoc == "INVTYPE_FINGER" then
         local first, firstReady = GetComparisonItem(11)
         local second, secondReady = GetComparisonItem(12)
-        return firstReady and secondReady
-            and FindBestPairedLoadout({candidate}, 11, 12) ~= nil
+        if firstReady and secondReady then
+            upgrade = FindBestPairedLoadout({candidate}, 11, 12)
+        end
     elseif candidate.equipLoc == "INVTYPE_TRINKET" then
         local first, firstReady = GetComparisonItem(13)
         local second, secondReady = GetComparisonItem(14)
-        return firstReady and secondReady
-            and FindBestPairedLoadout({candidate}, 13, 14) ~= nil
-    end
-
-    for _, slot in ipairs(GetCandidateSlots(candidate.equipLoc)) do
-        local equipped, ready = GetComparisonItem(slot)
-        if ready and (not equipped or (equipped.value ~= nil
-            and candidate.value > equipped.value)) then
-            return true
+        if firstReady and secondReady then
+            upgrade = FindBestPairedLoadout({candidate}, 13, 14)
         end
+    else
+        local bestGain
+        for _, slot in ipairs(GetCandidateSlots(candidate.equipLoc)) do
+            local equipped, ready = GetComparisonItem(slot)
+            if ready and (not equipped or (equipped.value ~= nil
+                and candidate.value > equipped.value)) then
+                local gain = candidate.value - (equipped and equipped.value or 0)
+                if bestGain == nil or gain > bestGain then bestGain = gain end
+            end
+        end
+        return bestGain
     end
-    return false
+    return upgrade and (upgrade.candidateValue - upgrade.equippedValue)
 end
+
+local highlightedQuestButtons = {}
 
 local function SetQuestRewardHighlight(button, visible)
     if not button.TailorUpgradeBorder and visible then
@@ -827,9 +857,14 @@ local function SetQuestRewardHighlight(button, visible)
     if button.TailorUpgradeBorder then
         button.TailorUpgradeBorder:SetShown(visible)
     end
+    highlightedQuestButtons[button] = visible and true or nil
 end
 
 local function ClearQuestRewardHighlights()
+    for button in pairs(highlightedQuestButtons) do
+        if button.TailorUpgradeBorder then button.TailorUpgradeBorder:Hide() end
+    end
+    wipe(highlightedQuestButtons)
     local frame = QuestInfoFrame and QuestInfoFrame.rewardsFrame
     if frame and frame.RewardButtons then
         for _, button in ipairs(frame.RewardButtons) do
@@ -848,7 +883,23 @@ local function RefreshQuestRewardHighlights()
     local frame = QuestInfoFrame.rewardsFrame
     if not frame or not frame.RewardButtons then return end
     local questID = GetQuestID()
-    for _, button in ipairs(frame.RewardButtons) do
+    local bestButton, bestGain, bestOrder
+    local renderQueued = false
+    local function RenderBestReward()
+        if renderQueued then return end
+        renderQueued = true
+        -- Render once after this batch of item callbacks has finished.
+        C_Timer.After(0, function()
+            renderQueued = false
+            if generation ~= questHighlightGeneration then return end
+            ClearQuestRewardHighlights()
+            if bestButton and QuestFrameRewardPanel:IsShown()
+                and GetQuestID() == questID and bestButton:IsShown() then
+                SetQuestRewardHighlight(bestButton, true)
+            end
+        end)
+    end
+    for order, button in ipairs(frame.RewardButtons) do
         if button:IsShown() and button.objectType == "item"
             and (button.type == "choice" or button.type == "reward") then
             local rewardType, rewardIndex = button.type, button:GetID()
@@ -868,8 +919,12 @@ local function RefreshQuestRewardHighlights()
                             and button.type == rewardType
                             and button:GetID() == rewardIndex
                             and GetQuestItemLink(rewardType, rewardIndex) == link then
-                            SetQuestRewardHighlight(button,
-                                IsQuestRewardUpgrade(candidate, rewardIndex))
+                            local gain = GetQuestRewardUpgradeGain(candidate, rewardIndex)
+                            if gain ~= nil and (bestGain == nil or gain > bestGain
+                                or (gain == bestGain and order < bestOrder)) then
+                                bestButton, bestGain, bestOrder = button, gain, order
+                                RenderBestReward()
+                            end
                         end
                     end)
                 end
@@ -1022,7 +1077,7 @@ end
 
 local optionsPanel = CreateFrame("Frame", "TailorOptionsPanel", UIParent)
 optionsPanel.name = "Tailor"
-optionsPanel:SetSize(520, 580)
+optionsPanel:SetSize(620, 440)
 local title = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
 title:SetPoint("TOPLEFT", 20, -20)
 title:SetText("Tailor - Stat Weights")
@@ -1036,8 +1091,10 @@ for index, entry in ipairs(WEIGHTS) do
     local key, label = entry[1], entry[2]
     local slider = CreateFrame("Slider", "TailorWeightSlider" .. index,
         optionsPanel, "OptionsSliderTemplate")
-    slider:SetPoint("TOPLEFT", 28, -88 - (index - 1) * 40)
-    slider:SetSize(285, 17)
+    local column = math.floor((index - 1) / 8)
+    local row = (index - 1) % 8
+    slider:SetPoint("TOPLEFT", 28 + column * 300, -88 - row * 40)
+    slider:SetSize(220, 17)
     slider:SetMinMaxValues(0, 1)
     slider:SetValueStep(0.01)
     slider:SetObeyStepOnDrag(true)

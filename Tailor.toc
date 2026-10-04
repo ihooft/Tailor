@@ -1,8 +1,8 @@
-## Interface: 120100
+## Interface: 16001
 ## Title: Tailor
 ## Notes: Finds armor and weapon upgrades in your bags.
-## Author: Custom
-## Version: 1.6.0
+## Author: idhooft
+## Version: 1.6.2
 ## LoadSavedVariablesFirst: 1
 ## SavedVariablesPerCharacter: TailorDB
 
